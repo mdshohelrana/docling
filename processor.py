@@ -7,10 +7,13 @@ import logging
 import os
 import sys
 import tempfile
+import time
+
+from tqdm import tqdm
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 from urllib.parse import urlparse
 
 try:
@@ -19,22 +22,24 @@ except ImportError:
     pypdf = None
 
 try:
-    from docling.datamodel.base_models import InputFormat
-    from docling.datamodel.pipeline_options import PdfPipelineOptions
+    from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
+    from docling.datamodel.base_models import ConversionStatus, InputFormat
+    from docling.datamodel.pipeline_options import ThreadedPdfPipelineOptions
     from docling.document_converter import DocumentConverter, PdfFormatOption
-except ImportError as _e:  # pragma: no cover - exercised when docling missing
+    from docling.pipeline.threaded_standard_pdf_pipeline import ThreadedStandardPdfPipeline
+except ImportError as _e:  # pragma: no cover
+    AcceleratorDevice = None  # type: ignore[misc, assignment]
+    AcceleratorOptions = None  # type: ignore[misc, assignment]
+    ConversionStatus = None  # type: ignore[misc, assignment]
     DocumentConverter = None  # type: ignore[misc, assignment]
     InputFormat = None  # type: ignore[misc, assignment]
     PdfFormatOption = None  # type: ignore[misc, assignment]
-    PdfPipelineOptions = None  # type: ignore[misc, assignment]
+    ThreadedPdfPipelineOptions = None  # type: ignore[misc, assignment]
+    ThreadedStandardPdfPipeline = None  # type: ignore[misc, assignment]
     _DOCLING_IMPORT_ERROR = _e
 else:
     _DOCLING_IMPORT_ERROR = None
 
-if TYPE_CHECKING:
-    from docling.document_converter import DocumentConverter as DocumentConverterType
-
-# --- Configuration (defaults) ---
 DEFAULT_OUTPUT_DIR = "./output"
 OUTPUT_EXTENSION = ".md"
 EXTENSIONS_PDF = (".pdf",)
@@ -50,10 +55,6 @@ ALL_EXTENSIONS = (
     + EXTENSIONS_XLSX
     + EXTENSIONS_CSV
 )
-
-LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
-SYMBOL_SUCCESS = "✓"
-SEPARATOR = "=" * 60
 
 __all__ = [
     "DoclingProcessor",
@@ -76,7 +77,7 @@ class DocumentType(Enum):
 
 
 class ProcessorError(Exception):
-    """Recoverable processing error (wrong type, missing file, bad password, etc.)."""
+    pass
 
 
 @dataclass
@@ -84,7 +85,7 @@ class ProcessingConfig:
     output_dir: Path = field(default_factory=lambda: Path(DEFAULT_OUTPUT_DIR))
     password: Optional[str] = None
     force_ocr: bool = False
-    verbose: bool = False
+    use_cuda: bool = False
 
 
 def _ensure_docling_loaded() -> None:
@@ -97,41 +98,40 @@ def _ensure_docling_loaded() -> None:
 def _pdf_is_encrypted(path: str) -> bool:
     if not pypdf:
         return False
+    with open(path, "rb") as f:
+        return bool(pypdf.PdfReader(f).is_encrypted)
+
+
+def _decrypt_pdf_to_temp(input_path: str, password: str) -> str:
+    if not pypdf:
+        raise ProcessorError("Install pypdf for encrypted PDFs: pip install pypdf")
+    reader = pypdf.PdfReader(input_path)
+    if not reader.decrypt(password):
+        raise ProcessorError("Incorrect PDF password or decryption failed")
+    tmp = tempfile.NamedTemporaryFile(suffix=".pdf", prefix="decrypted_", delete=False)
+    temp_path = tmp.name
+    writer = pypdf.PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
     try:
-        with open(path, "rb") as f:
-            return bool(pypdf.PdfReader(f).is_encrypted)
-    except OSError:
-        raise
-    except Exception as exc:  # pypdf may raise on corrupt PDF
-        raise ProcessorError(f"Could not read PDF for encryption check: {exc}") from exc
+        writer.write(tmp)
+        tmp.flush()
+    finally:
+        tmp.close()
+    return temp_path
+
+
+def _accelerator_device(cfg: ProcessingConfig) -> "AcceleratorDevice":
+    if cfg.use_cuda:
+        return AcceleratorDevice.CUDA
+    return AcceleratorDevice.CPU
 
 
 class DoclingProcessor:
-    """Convert documents to markdown using Docling."""
-
     def __init__(self, config: Optional[ProcessingConfig] = None) -> None:
         _ensure_docling_loaded()
         self.config = config or ProcessingConfig()
-        self.logger = self._setup_logger()
-        self._ensure_output_directory()
-
-    def _setup_logger(self) -> logging.Logger:
-        logger = logging.getLogger(self.__class__.__name__)
-        logger.setLevel(logging.DEBUG if self.config.verbose else logging.INFO)
-        if not logger.handlers:
-            handler = logging.StreamHandler(sys.stderr)
-            handler.setFormatter(logging.Formatter(LOG_FORMAT))
-            logger.addHandler(handler)
-        return logger
-
-    def _ensure_output_directory(self) -> None:
-        try:
-            self.config.output_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            raise ProcessorError(
-                f"Cannot create output directory {self.config.output_dir}: {exc}"
-            ) from exc
-        self.logger.info("Output directory: %s", self.config.output_dir.resolve())
+        self.config.output_dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def _detect_document_type(input_path: str) -> DocumentType:
@@ -159,253 +159,127 @@ class DoclingProcessor:
             base = Path(input_path).stem
         return self.config.output_dir / f"{base}{OUTPUT_EXTENSION}"
 
-    def _create_converter(self, doc_type: DocumentType) -> DocumentConverterType:
-        """Wire PdfPipelineOptions into DocumentConverter when OCR is required (Docling best practice)."""
-        if self.config.force_ocr:
-            pdf_options = PdfPipelineOptions()
-            pdf_options.do_ocr = True
-            self.logger.info("OCR enabled (PdfPipelineOptions.do_ocr=True)")
-            return DocumentConverter(
-                format_options={
-                    InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_options),
-                }
-            )
-        return DocumentConverter()
+    def _create_threaded_pdf_converter(self) -> DocumentConverter:
+        pipeline_options = ThreadedPdfPipelineOptions(
+            accelerator_options=AcceleratorOptions(device=_accelerator_device(self.config)),
+            ocr_batch_size=4,
+            layout_batch_size=64,
+            table_batch_size=4,
+        )
+        pipeline_options.do_ocr = self.config.force_ocr
+        return DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(
+                    pipeline_cls=ThreadedStandardPdfPipeline,
+                    pipeline_options=pipeline_options,
+                )
+            }
+        )
 
-    def _decrypt_pdf_to_temp(self, input_path: str, password: str) -> str:
-        if not pypdf:
-            raise ProcessorError("pypdf is required for encrypted PDFs. Install with: pip install pypdf")
-
-        try:
-            reader = pypdf.PdfReader(input_path)
-        except OSError as exc:
-            raise ProcessorError(f"Cannot open PDF: {exc}") from exc
-        except Exception as exc:
-            raise ProcessorError(f"Invalid or unreadable PDF: {exc}") from exc
-
-        if not reader.decrypt(password):
-            raise ProcessorError("Incorrect PDF password or decryption failed")
-
-        tmp = tempfile.NamedTemporaryFile(suffix=".pdf", prefix="decrypted_", delete=False)
-        temp_path = tmp.name
-        try:
-            writer = pypdf.PdfWriter()
-            for page in reader.pages:
-                writer.add_page(page)
-            writer.write(tmp)
-            tmp.flush()
-        except Exception:
-            tmp.close()
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
-            raise
-        tmp.close()
-
-        self.logger.debug("Decrypted PDF written to temporary file: %s", temp_path)
-        return temp_path
-
-    def _prepare_pdf_input(self, input_path: str) -> tuple[str, Optional[str]]:
-        """
-        Return (path_to_convert, temp_path_or_none).
-        temp_path must be removed by caller when conversion finishes.
-        """
+    def _prepare_local_pdf(self, input_path: str) -> tuple[str, Optional[str]]:
         if not os.path.isfile(input_path):
             raise ProcessorError(f"File not found: {input_path}")
-
-        encrypted = _pdf_is_encrypted(input_path)
-        if not encrypted:
-            if self.config.password:
-                self.logger.warning("Password was provided but PDF is not encrypted; ignoring password")
+        if not _pdf_is_encrypted(input_path):
             return input_path, None
-
-        self.logger.warning("Password-protected PDF: %s", input_path)
         if not self.config.password:
-            raise ProcessorError("PDF is encrypted; provide --password / ProcessingConfig.password")
+            raise ProcessorError("PDF is encrypted; set password in ProcessingConfig")
+        temp_path = _decrypt_pdf_to_temp(input_path, self.config.password)
+        return temp_path, temp_path
 
-        temp = self._decrypt_pdf_to_temp(input_path, self.config.password)
-        self.logger.info("Decrypted PDF for Docling pipeline")
-        return temp, temp
-
-    def process_document(self, input_path: str) -> Optional[Path]:
-        self.logger.info("Processing: %s", input_path)
-
+    def process_document(self, input_path: str) -> Path:
         doc_type = self._detect_document_type(input_path)
-        self.logger.info("Document type: %s", doc_type.value)
-
         if doc_type == DocumentType.UNKNOWN:
-            self.logger.error("Unknown document type: %s", input_path)
-            return None
+            raise ProcessorError(f"Unknown document type: {input_path}")
 
-        temp_file: Optional[str] = None
+        temp_path: Optional[str] = None
         path_to_convert = input_path
 
+        if doc_type == DocumentType.PDF:
+            path_to_convert, temp_path = self._prepare_local_pdf(input_path)
+
+        output_path = self._get_output_filename(input_path, doc_type)
+
         try:
-            if doc_type == DocumentType.PDF and not input_path.startswith(URL_PROTOCOLS):
-                path_to_convert, temp_file = self._prepare_pdf_input(input_path)
+            if doc_type == DocumentType.PDF:
+                doc_converter = self._create_threaded_pdf_converter()
+                doc_converter.initialize_pipeline(InputFormat.PDF)
+            else:
+                doc_converter = DocumentConverter()
 
-            output_path = self._get_output_filename(input_path, doc_type)
-            converter = self._create_converter(doc_type)
+            conv_result = doc_converter.convert(path_to_convert)
+            if conv_result.status != ConversionStatus.SUCCESS:
+                raise ProcessorError(f"Conversion failed: {conv_result.status}")
 
-            self.logger.info("Converting document...")
-            result = converter.convert(path_to_convert)
-
-            self.logger.info("Exporting to markdown: %s", output_path)
-            markdown_content = result.document.export_to_markdown()
-
-            try:
-                output_path.write_text(markdown_content, encoding="utf-8")
-            except OSError as exc:
-                self.logger.error("Failed to write output %s: %s", output_path, exc)
-                return None
-
-            self.logger.info("%s Successfully saved: %s", SYMBOL_SUCCESS, output_path)
+            output_path.write_text(conv_result.document.export_to_markdown(), encoding="utf-8")
             return output_path
-
-        except ProcessorError as exc:
-            self.logger.error("%s", exc)
-            return None
-        except OSError as exc:
-            self.logger.error("I/O error during conversion: %s", exc)
-            if self.config.verbose:
-                self.logger.exception("Details:")
-            return None
-        except Exception as exc:  # Docling may raise various conversion errors
-            self.logger.error("Processing failed: %s", exc)
-            if self.config.verbose:
-                self.logger.exception("Details:")
-            return None
         finally:
-            if temp_file and os.path.exists(temp_file):
-                try:
-                    os.remove(temp_file)
-                    self.logger.debug("Removed temporary decrypted file")
-                except OSError as exc:
-                    self.logger.warning("Could not remove temporary file %s: %s", temp_file, exc)
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
 
-    def process_batch(self, input_paths: list[str]) -> dict[str, Optional[Path]]:
-        results: dict[str, Optional[Path]] = {}
-        total = len(input_paths)
-        self.logger.info("Processing %d document(s)...", total)
-
-        for idx, path in enumerate(input_paths, 1):
-            self.logger.info("\n[%d/%d] Processing: %s", idx, total, path)
-            results[path] = self.process_document(path)
-
-        successful = sum(1 for v in results.values() if v is not None)
-        self.logger.info(
-            "\n%s\nProcessing complete: %d/%d successful\n%s",
-            SEPARATOR,
-            successful,
-            total,
-            SEPARATOR,
-        )
-        return results
+    def process_batch(self, input_paths: list[str]) -> dict[str, Path]:
+        return {p: self.process_document(p) for p in input_paths}
 
 
 def collect_files_from_directory(directory: Path, recursive: bool = False) -> list[str]:
     if not directory.is_dir():
         return []
-
     iterator = directory.rglob("*") if recursive else directory.glob("*")
-    files = [
+    return sorted(
         str(p)
         for p in iterator
         if p.is_file() and p.suffix.lower() in ALL_EXTENSIONS
-    ]
-    return sorted(files)
+    )
 
 
 def main() -> None:
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    logging.getLogger("docling").setLevel(logging.ERROR)
+
     parser = argparse.ArgumentParser(
-        description="Convert documents (PDF, DOCX, PPTX, XLSX, CSV, URL) to Markdown using Docling",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python processor.py document.pdf
-  python processor.py encrypted.pdf --password mypassword
-  python processor.py file1.pdf file2.docx ./documents/
-  python processor.py ./documents/ --recursive
-  python processor.py https://example.com/document.pdf
-  python processor.py document.pdf --output-dir ./converted
-  python processor.py scanned.pdf --force-ocr --verbose
-""",
+        description="Convert documents to Markdown with Docling (threaded PDF pipeline for local PDFs).",
     )
-    parser.add_argument(
-        "inputs",
-        nargs="+",
-        help="Path(s) to document(s), directory, or URL(s) to process",
-    )
-    parser.add_argument(
-        "-o",
-        "--output-dir",
-        type=Path,
-        default=Path(DEFAULT_OUTPUT_DIR),
-        help=f"Output directory for markdown files (default: {DEFAULT_OUTPUT_DIR})",
-    )
-    parser.add_argument(
-        "-p",
-        "--password",
-        help="Password for encrypted PDFs",
-    )
-    parser.add_argument(
-        "--force-ocr",
-        action="store_true",
-        help="Force OCR for PDF (PdfPipelineOptions.do_ocr)",
-    )
-    parser.add_argument(
-        "-r",
-        "--recursive",
-        action="store_true",
-        help="Recursively collect files from directories",
-    )
-    parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Verbose logging",
-    )
+    parser.add_argument("inputs", nargs="+", help="Files, directories, or URLs")
+    parser.add_argument("-o", "--output-dir", type=Path, default=Path(DEFAULT_OUTPUT_DIR))
+    parser.add_argument("-p", "--password", help="Password for encrypted PDFs")
+    parser.add_argument("--force-ocr", action="store_true", help="Enable OCR on PDF pipeline")
+    parser.add_argument("--cuda", action="store_true", help="Use AcceleratorDevice.CUDA for threaded PDF pipeline")
+    parser.add_argument("-r", "--recursive", action="store_true")
     args = parser.parse_args()
 
-    try:
-        _ensure_docling_loaded()
-    except ProcessorError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(1)
+    _ensure_docling_loaded()
 
     all_inputs: list[str] = []
     for raw in args.inputs:
         p = Path(raw)
         if p.is_dir():
             found = collect_files_from_directory(p, recursive=args.recursive)
-            if found:
-                all_inputs.extend(found)
-            else:
-                print(f"Warning: No supported files in directory: {raw}", file=sys.stderr)
+            if not found:
+                print(f"No supported files in: {raw}", file=sys.stderr)
+                sys.exit(1)
+            all_inputs.extend(found)
         else:
             all_inputs.append(raw)
 
     if not all_inputs:
-        print("Error: No valid files to process", file=sys.stderr)
+        print("No inputs to process.", file=sys.stderr)
         sys.exit(1)
 
-    config = ProcessingConfig(
+    cfg = ProcessingConfig(
         output_dir=args.output_dir,
         password=args.password,
         force_ocr=args.force_ocr,
-        verbose=args.verbose,
+        use_cuda=args.cuda,
     )
-
-    try:
-        processor = DoclingProcessor(config)
-    except ProcessorError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(1)
-
-    results = processor.process_batch(all_inputs)
-    failed = sum(1 for v in results.values() if v is None)
-    sys.exit(0 if failed == 0 else 1)
+    proc = DoclingProcessor(cfg)
+    total_start = time.perf_counter()
+    with tqdm(all_inputs, desc="Processing", unit="file") as pbar:
+        for path in pbar:
+            pbar.set_postfix_str(Path(path).name, refresh=False)
+            tqdm.write(str(proc.process_document(path)), file=sys.stdout)
+    print(
+        f"Total processing time: {time.perf_counter() - total_start:.2f} seconds",
+        file=sys.stderr,
+    )
 
 
 if __name__ == "__main__":

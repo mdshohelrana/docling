@@ -3,3 +3,4 @@ docling>=1.0.0
 
 # Optional dependencies for enhanced functionality
 pypdf>=3.0.0  # For password-protected PDF detection and handling
+tqdm>=4.66.0  # CLI progress bar
